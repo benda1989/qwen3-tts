@@ -8,6 +8,7 @@ import threading
 from datetime import datetime
 
 import torch
+import torchaudio
 import gradio as gr
 from qwen_tts import Qwen3TTSModel
 
@@ -26,7 +27,7 @@ def get_devices():
     return devices
 
 class UI:
-    LANGUAGES = ["Auto", "Chinese", "English", "Japanese", "Korean", "German", "French", "Russian", "Portuguese", "Spanish", "Italian"]#['auto', 'chinese', 'english', 'french', 'german', 'italian', 'japanese', 'korean', 'portuguese', 'russian', 'spanish']
+    LANGUAGES = ["Auto", "Chinese", "English", "Japanese", "Korean", "German", "French", "Russian", "Portuguese", "Spanish", "Italian"]
     DTYPES = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
     def __init__(self):
         self.save_dir = "models"
@@ -44,6 +45,8 @@ class UI:
         self.dtype = self.DTYPES[dtype]
 
     def init_asr(self):
+        if self.asr_model is not None:
+            del self.asr_model 
         try:
             from funasr import AutoModel
             self.asr_model = AutoModel(
@@ -58,7 +61,7 @@ class UI:
         if not self.asr_model:
             self.init_asr()
         try:
-            result = self.asr_model.generate(input=audio_path, language="auto", use_itn=True )
+            result = self.asr_model.generate(input=audio_path, language="auto", use_itn=False )
             return result[0]["text"].split('|>')[-1].strip() if result else ""
         except:
             return ""
@@ -68,22 +71,28 @@ class UI:
         self.logs += message + "\n"
         self.status = status
     
-    def prepare_training_data(self, audio_files, transcripts):
-        temp_dir = tempfile.mkdtemp(prefix="qwen3_tts_training_")
+    def prepare_training_data(self, audio_files, transcripts, ref_audio=None):
+        temp_dir = tempfile.mkdtemp(prefix="qt_training_")
         data_dir = os.path.join(temp_dir, "data")
         os.makedirs(data_dir, exist_ok=True)
         jsonl_path = os.path.join(temp_dir, "train_raw.jsonl")
         ref_audio_path = None
-        
+        def c24(ap,dp):
+            waveform, sr = torchaudio.load(ap)
+            if sr != 24000:
+                waveform = torchaudio.functional.resample(waveform, sr, 24000)
+            torchaudio.save(dp, waveform, 24000)
+            return dp
+        if ref_audio:
+            ref_audio_path = c24(ref_audio, os.path.join(data_dir, "ref.wav"))
+            self.log(f"Using uploaded reference audio")
+
         with open(jsonl_path, 'w', encoding='utf-8') as f:
             for i, (audio_file, transcript) in enumerate(zip(audio_files, transcripts)):
                 if audio_file is None or not transcript.strip():
                     continue
-        
                 audio_filename = f"utt{i:04d}.wav"
-                audio_dest = os.path.join(data_dir, audio_filename)
-                audio_path = audio_file.name if hasattr(audio_file, 'name') else audio_file
-                shutil.copy(audio_path, audio_dest)
+                audio_dest = c24(audio_file.name if hasattr(audio_file, 'name') else audio_file, os.path.join(data_dir, audio_filename))
                 if ref_audio_path is None:
                     ref_audio_path = audio_dest
                     self.log(f"Using {audio_filename} as reference audio for all samples")
@@ -94,17 +103,18 @@ class UI:
                     "ref_audio": ref_audio_path 
                 }
                 f.write(json.dumps(entry, ensure_ascii=False) + '\n')
+        self.log(f"Prepared {len(os.listdir(data_dir))} training samples with audio codes")
         return temp_dir
     
-    def train(self, audio_files, texts, model_name, speaker, base_model, lr, batch_size, epochs):
+    def train(self, audio_files, texts, ref_audio, model_name, speaker, base_model, lr, batch_size, epochs):
         if not audio_files or not texts:
             self.log("❌ Audio files or texts are empty!", "Done")
-            return  
+            return
         self.log("📝 Preparing data with audio codes...")
-        training_dir = self.prepare_training_data(audio_files, texts) 
+        training_dir = self.prepare_training_data(audio_files, texts, ref_audio) 
+        self.log(f"Cache dir: {training_dir}")
         prepare_cmd = [
             "python", "finetuning/prepare_data.py",
-            "--device", self.device,
             "--tokenizer_model_path", "Qwen3-TTS-Tokenizer-12Hz",
             "--input_jsonl", os.path.join(training_dir, "train_raw.jsonl"),
             "--output_jsonl", os.path.join(training_dir, "train_with_codes.jsonl")
@@ -113,10 +123,16 @@ class UI:
         env = os.environ.copy()
         project_root = os.path.dirname(os.path.abspath(__file__))
         env['PYTHONPATH'] = project_root + ":" + env.get('PYTHONPATH', '')
+        env['CUDA_VISIBLE_DEVICES']=self.device.split(":")[-1]
+        if self.device.startswith("cuda:"):
+            env['CUDA_VISIBLE_DEVICES'] = self.device.split(":")[-1]
+        else:
+            print(self.device)
         result = subprocess.run(prepare_cmd, capture_output=True, text=True, env=env)
         if result.returncode != 0:
             self.log(f"❌ Data preparation failed:" )
             self.log(result.stderr, "Done")
+            shutil.rmtree(training_dir)
             return 
         self.log("✅ Data preparation completed successfully!" )
 
@@ -131,7 +147,7 @@ class UI:
                 "--batch_size", str(batch_size),
                 "--lr", str(lr),
                 "--num_epochs", str(epochs),
-                "--speaker_name", speaker
+                "--speaker_name", speaker,
             ]
             self.log("🔥 Starting training process..." )
             process = subprocess.Popen(
@@ -150,7 +166,7 @@ class UI:
             process.wait()
             
             if process.returncode == 0:
-                final_path = os.path.join(output_dir, f"epoch-{epochs-1}")
+                final_path = os.path.join(output_dir, f"checkpoint-epoch-{epochs-1}")
                 if os.path.exists(final_path):
                     self.log("✅ Train successfully! Ready for testing.")
                 else:
@@ -192,7 +208,7 @@ class UI:
             return [], f"Model directory not found: {model_dir}"
         checkpoints = []
         for item in sorted(os.listdir(model_dir)):
-            if item.startswith("epoch-"):
+            if item.startswith("checkpoint-"):
                 checkpoint_path = os.path.join(model_dir, item)
                 if os.path.exists(os.path.join(checkpoint_path, "model.safetensors")):
                     checkpoints.append((item, checkpoint_path))
@@ -258,96 +274,137 @@ def create_ui(train=False,device=None,dtype=None):
                 else:
                     gr.Markdown(f"🔢 **数据类型**: {dtype}")
         with gr.Tabs():  
-            from generate import Generate
             with gr.Tab("Generate"):      
+                from generate import Generate
                 generate = Generate(SAVE_DIR)
                 generate.interface(ui)
-                with gr.Tab("Generates"):
-                    generate.interface2(ui)
+            with gr.Tab("Generates"):
+                generate.interface2(ui)
             if not train:
                 return interface
             with gr.Tab("Train"):
 
                 with gr.Tab("📁 1 Prepare"):
-                    files = gr.File(file_count="multiple", file_types=["audio"], label="Audio Files")
-                    files_state = gr.State([])
-                    texts_state = gr.State({})
-                    
+                    with gr.Column() as upload_area:
+                        files = gr.File(file_count="multiple", file_types=["audio"], label="Audio Files")
+                    data_state = gr.State([])
+
                     with gr.Row():
                         add_more_btn = gr.UploadButton("Add More", file_count="multiple", file_types=["audio"], visible=False)
                         clear_btn = gr.Button("Clear All", variant="stop", visible=False)
-                    
-                    @gr.render(inputs=[files_state, texts_state], triggers=[files_state.change])
-                    def render_items(files, texts):
-                        if not files:
+
+                    @gr.render(inputs=[data_state], triggers=[data_state.change])
+                    def render_items(data_list):
+                        if not data_list:
                             gr.Markdown("*No files uploaded*")
                             return
-                        
-                        for file in files:
-                            path = file.name if hasattr(file, 'name') else file
+
+                        for idx, item in enumerate(data_list):
+                            path = item["path"]
                             name = os.path.basename(path)
-                            
+
                             with gr.Row():
-                                gr.Audio(value=path, label=name, scale=2)
-                                text = gr.Textbox( value=texts.get(path, ""), label="", lines=5, scale=3 )
-                                
-                                def update_text(new_text, path=path):
-                                    texts_state.value[path] = new_text
-                                    return texts_state.value
-                                
-                                text.change(update_text, inputs=[text], outputs=[texts_state])
-                    
-                    def process_files(files, prev_texts=None):
-                        if not files:
-                            return [], {}, gr.update(visible=False), gr.update(visible=False)
-                        texts = prev_texts.copy() if prev_texts else {}
-                        for file in files:
+                                audio = gr.Audio(sources='upload', type='filepath', value=path, label=name, interactive=True)
+                                text = gr.Textbox(value=item["text"], label="", lines=5)
+
+                                def on_audio_edit(new_path, id=idx):
+                                    if not new_path:
+                                        del data_list[id]
+                                        return data_list, gr.update()
+                                    if new_path != data_list[id]["path"]:
+                                        data_list[id]["path"] = new_path
+                                        new_text = ui.recognize(new_path)
+                                        data_list[id]["text"] = new_text
+                                        return data_list, new_text
+                                    return data_list, gr.update()
+
+                                audio.change(on_audio_edit, inputs=[audio], outputs=[data_state, text])
+
+                                def update_text(new_text, id=idx):
+                                    data_list[id]["text"] = new_text
+
+                                text.change(update_text, inputs=[text])
+
+                    def audio_duration(path):
+                        try:
+                            info = torchaudio.info(path)
+                            return info.num_frames / info.sample_rate
+                        except Exception as e:
+                            try:
+                                waveform, sr = torchaudio.load(path)
+                                return waveform.shape[1] / sr
+                            except Exception as e2:
+                                return 0
+
+                    def process_files(uploaded, prev_data=None):
+                        if not uploaded:
+                            return [], gr.update(visible=False), gr.update(visible=False), gr.update(visible=True)
+                        prev_texts = {item["path"]: item["text"] for item in prev_data} if prev_data else {}
+                        data = []
+                        for file in uploaded:
                             path = file.name if hasattr(file, 'name') else file
-                            if path not in texts:
-                                texts[path] = ui.recognize(path)
-                        return files, texts, gr.update(visible=True), gr.update(visible=True)
-                    
-                    files.change(process_files, [files, texts_state], [files_state, texts_state, add_more_btn, clear_btn])
-                    
+                            dur = audio_duration(path)
+                            if dur < 5:
+                                print(f"Skip {path} with duration {dur:.2f} seconds")
+                                continue
+                            text = prev_texts.get(path, ui.recognize(path))
+                            data.append({"path": path, "text": text, "duration": dur})
+                        data.sort(key=lambda x: x["duration"])
+                        return data, gr.update(visible=True), gr.update(visible=True), gr.update(visible=False)
+
+                    files.change(process_files, [files, data_state], [data_state, add_more_btn, clear_btn, upload_area])
+
+                    def add_more_files(old_data, new_files):
+                        existing_paths = {item["path"] for item in old_data} if old_data else set()
+                        data = list(old_data) if old_data else []
+                        for file in new_files:
+                            path = file.name if hasattr(file, 'name') else file
+                            if path not in existing_paths:
+                                dur = audio_duration(path)
+                                if dur < 3:
+                                    continue
+                                data.append({"path": path, "text": ui.recognize(path), "duration": dur})
+                        data.sort(key=lambda x: x["duration"])
+                        return data, gr.update(visible=True), gr.update(visible=True), gr.update(visible=False)
+
                     add_more_btn.upload(
-                        lambda old, new, txts: process_files(list(old) + new if old else new, txts),
-                        [files_state, add_more_btn, texts_state],
-                        [files_state, texts_state, add_more_btn, clear_btn]
-                    ).then(lambda fs: gr.update(value=fs), files_state, files)
-                    
+                        add_more_files,
+                        [data_state, add_more_btn],
+                        [data_state, add_more_btn, clear_btn, upload_area]
+                    )
+
                     clear_btn.click(
-                        lambda: ([], {}, None, gr.update(visible=False), gr.update(visible=False)),
-                        outputs=[files_state, texts_state, files, add_more_btn, clear_btn]
+                        lambda: ([], gr.update(value=None), gr.update(visible=False), gr.update(visible=False), gr.update(visible=True)),
+                        outputs=[data_state, files, add_more_btn, clear_btn, upload_area]
                     )
 
                 with gr.Tab("⚙️ 2 Training"):
                     with gr.Row():
                         model_name = gr.Textbox( label="Model Name", value=f"custom_{datetime.now().strftime('%y%m%d_%H%M')}" )
                         speaker_name = gr.Textbox(label="Speaker Name", value="my_voice")
-                    
-                    base_model = gr.Dropdown( choices=["Qwen3-TTS-12Hz-1.7B-Base", "Qwen3-TTS-12Hz-0.6B-Base"], value="Qwen3-TTS-12Hz-1.7B-Base", label="Base Model")
-                    
+
                     with gr.Row():
-                        lr = gr.Slider(1e-6, 1e-3, value=2e-5, label="Learning Rate")
+                        ref_audio = gr.Audio(sources='upload', type='filepath', label="Reference Audio (optional, defaults to first training sample)")
+                        base_model = gr.Dropdown( choices=["Qwen3-TTS-12Hz-1.7B-Base", "Qwen3-TTS-12Hz-0.6B-Base"], value="Qwen3-TTS-12Hz-1.7B-Base", label="Base Model")
+                    gr.Markdown("⚠️ 30个音频，6-10s，建议超参：1e-5 / 2 / 4，loss低于7效果会变差")
+                    with gr.Row():
+                        lr = gr.Slider(1e-6, 1e-3, value=1e-5, label="Learning Rate")
                         batch_size = gr.Slider(1, 16, value=2, step=1, label="Batch Size")
-                        epochs = gr.Slider(1, 10, value=3, step=1, label="Epochs")
+                        epochs = gr.Slider(1, 10, value=4, step=1, label="Epochs")
                     
                     train_btn = gr.Button("🚀 Start Training", variant="primary")
                     logs = gr.Textbox(label="", lines=15)
                     timer = gr.Timer(value=2, active=False)
                     
-                    def start_train(files, texts, *args):
-                        ordered_texts = []
-                        for file in files:
-                            path = file.name if hasattr(file, 'name') else file
-                            if path in texts:
-                                ordered_texts.append(texts[path])
-                        threading.Thread(target=ui.train, args=(files, ordered_texts, *args),daemon=True).start()
+                    def start_train(data, ref, *args):
+                        files = [item["path"] for item in data]
+                        texts = [item["text"] for item in data]
+                        threading.Thread(target=ui.train, args=(files, texts, ref, *args),daemon=True).start()
                         return gr.Timer(active=True), gr.Button(value="⏳ Training in Progress...", interactive=False)
-                    
+
                     train_btn.click(
                         start_train,
-                        inputs=[files_state, texts_state, model_name, speaker_name, base_model, lr, batch_size, epochs],
+                        inputs=[data_state, ref_audio, model_name, speaker_name, base_model, lr, batch_size, epochs],
                         outputs=[timer, train_btn]
                     )
                     
@@ -370,7 +427,7 @@ def create_ui(train=False,device=None,dtype=None):
                             scale=8,
                         )
                         refresh_models_btn = gr.Button("🔄 Refresh", scale=1)
-                    
+                        refresh_models_btn.click( lambda: gr.update(choices=ui.get_models() ), outputs=[model_dropdown])
                     test_text = gr.Textbox(label="Text", value="你好，这是测试。", lines=3)
                     with gr.Row():
                         test_lang = gr.Dropdown(["Auto", "Chinese", "English", "Japanese", "Korean", "German", "French", "Russian", "Portuguese", "Spanish", "Italian"], value="Chinese", label="Language")
@@ -405,15 +462,14 @@ def create_ui(train=False,device=None,dtype=None):
                                         save_status = gr.Markdown("")
                                         
                                         save_btn.click(
+                                            lambda: gr.update(interactive=False),
+                                            outputs=[save_btn]
+                                        ).then(
                                             lambda save_name: ui.save_model_checkpoint( checkpoint_path, save_name),
                                             inputs=[save_name_input],
                                             outputs=[save_status]
                                         )
 
-                    refresh_models_btn.click(
-                        lambda: ui.get_models(),
-                        outputs=[model_dropdown]
-                    )
 
                     def start_test(model, text, lang, speaker, instruct):
                         yield gr.State([]), gr.Button("⏳ Generating...", interactive=False)
@@ -440,7 +496,7 @@ if __name__ == "__main__":
                         help="服务地址 (默认: 0.0.0.0)")
     parser.add_argument("-d", "--device", type=str, default=None,
                         help="设备 (例如: cpu, cuda:0, cuda:1)")
-    parser.add_argument("--dtype", type=str, default=None,
+    parser.add_argument("-dt","--dtype", type=str, default=None,
                         choices=["bfloat16", "float16", "float32"],
                         help="数据类型 (默认: bfloat16)")    
     args = parser.parse_args()
