@@ -75,14 +75,16 @@ modelscope download --model Qwen/Qwen3-TTS-12Hz-0.6B-Base --local_dir ./Qwen3-TT
 ```
 ### 启动方式
 
-#### 1. 基础使用（仅生成功能）
-```bash
-python main.py
-```
 
-#### 2. 完整功能（包含训练）
+
+#### 1. 完整功能（包含训练）
 ```bash
 python main.py --train
+```
+
+#### 2. 基础使用（仅生成功能）
+```bash
+python main.py
 ```
 
 #### 3. 自定义配置
@@ -95,4 +97,18 @@ python main.py --train --port 8080 --device cuda:0 --dtype bfloat16
 - `--port` / `-p`: 服务端口 (默认: 8886)
 - `--server` / `-s`: 服务地址 (默认: 0.0.0.0)
 - `--device` / `-d`: 计算设备 (cuda:0, cpu 等)
-- `--dtype`: 数据精度 (bfloat16, float16, float32)
+- `--dtype`: / `-dt` 数据精度 (bfloat16, float16, float32)
+
+## 注意事项
+### Qwen3-TTS 源码问题
+#### 1. 微调
+- 不支持`./Qwen3-TTS-12Hz-0.6B-Base`，仅支持`./Qwen3-TTS-12Hz-1.7B-Base`
+- 微调时，需要修改`finetuning/sft_12hz.py`中的43行`accelerator = Accelerator(gradient_accumulation_steps=4, mixed_precision="bf16", log_with="tensorboard",project_dir="logs")`
+#### 2. 推理
+- 推理时，`generate_voice_design`和`generate_custom_voice` 批量生成时会自动pad导致杂音，可以自行修改`qwen_tts/inference/qwen3_tts_model.py`中737和838行
+```
+        wavs, fs = [], None
+        for c in talker_codes_list:
+            w, fs = self.model.speech_tokenizer.decode([{"audio_codes": c}])
+            wavs.append(w[0])
+```

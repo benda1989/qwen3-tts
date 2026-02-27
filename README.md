@@ -95,5 +95,19 @@ python main.py --train --port 8080 --device cuda:0 --dtype bfloat16
 - `--port` / `-p`: Service port (default: 8886)
 - `--server` / `-s`: Service address (default: 0.0.0.0)
 - `--device` / `-d`: Computing device (cuda:0, cpu, etc.)
-- `--dtype`: Data precision (bfloat16, float16, float32)
+- `--dtype`: / `-dt` Data precision (bfloat16, float16, float32)
+
+## Notes
+### Qwen3-TTS Source Code Issues
+#### 1. Fine-tuning
+- Does not support `./Qwen3-TTS-12Hz-0.6B-Base`, only supports `./Qwen3-TTS-12Hz-1.7B-Base`
+- When fine-tuning, you need to modify line 43 in `finetuning/sft_12hz.py`: `accelerator = Accelerator(gradient_accumulation_steps=4, mixed_precision="bf16", log_with="tensorboard",project_dir="logs")`
+#### 2. Inference
+- During inference, `generate_voice_design` and `generate_custom_voice` will automatically pad when generating in batch, causing noise artifacts. You can modify lines 737 and 838 in `qwen_tts/inference/qwen3_tts_model.py`:
+```
+        wavs, fs = [], None
+        for c in talker_codes_list:
+            w, fs = self.model.speech_tokenizer.decode([{"audio_codes": c}])
+            wavs.append(w[0])
+```
 
